@@ -41,6 +41,7 @@ public class App
 			// Shut down all event loops to terminate all threads.
 			bossGroup.shutdownGracefully();
 			workGroup.shutdownGracefully();
+			
 		}
 	}
     public static void main( String[] args )throws Exception

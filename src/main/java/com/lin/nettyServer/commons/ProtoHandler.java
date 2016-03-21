@@ -4,9 +4,9 @@ import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
 import io.netty.buffer.CompositeByteBuf;
 import io.netty.buffer.Unpooled;
+import io.netty.channel.ChannelHandlerAdapter;
 import io.netty.channel.ChannelHandlerContext;
-import io.netty.channel.ChannelInboundHandlerAdapter;
-import io.netty.channel.socket.ChannelInputShutdownEvent;
+import io.netty.channel.ChannelHandler.Sharable;
 import io.netty.handler.codec.ByteToMessageDecoder;
 import io.netty.handler.codec.DecoderException;
 import io.netty.util.CharsetUtil;
@@ -20,20 +20,17 @@ import org.apache.log4j.Logger;
 import com.alibaba.fastjson.JSON;
 import com.alibaba.fastjson.JSONObject;
 
-public class ProtoHandler extends ChannelInboundHandlerAdapter{
+@Sharable
+public class ProtoHandler extends ChannelHandlerAdapter{
 	
-	protected final static Logger LOGGER = Logger.getLogger(ProtoHandler.class);
+	private static Logger logger = Logger.getLogger(ProtoHandler.class);
+	private Dispather dispather;
 	
-	protected Dispather dispather;
-	
-	public ProtoHandler(Dispather dispather) {
-		this.dispather = dispather;
-	}
-	
-	 /**
+    /**
      * Cumulate {@link ByteBuf}s by merge them into one {@link ByteBuf}'s, using memory copies.
      */
     public static final Cumulator MERGE_CUMULATOR = new Cumulator() {
+        @Override
         public ByteBuf cumulate(ByteBufAllocator alloc, ByteBuf cumulation, ByteBuf in) {
             ByteBuf buffer;
             if (cumulation.writerIndex() > cumulation.maxCapacity() - in.readableBytes()
@@ -61,7 +58,7 @@ public class ProtoHandler extends ChannelInboundHandlerAdapter{
      * and the decoder implementation this may be slower then just use the {@link #MERGE_CUMULATOR}.
      */
     public static final Cumulator COMPOSITE_CUMULATOR = new Cumulator() {
-        
+        @Override
         public ByteBuf cumulate(ByteBufAllocator alloc, ByteBuf cumulation, ByteBuf in) {
             ByteBuf buffer;
             if (cumulation.refCnt() > 1) {
@@ -80,7 +77,7 @@ public class ProtoHandler extends ChannelInboundHandlerAdapter{
                     composite = (CompositeByteBuf) cumulation;
                 } else {
                     int readable = cumulation.readableBytes();
-                    composite = alloc.compositeBuffer(Integer.MAX_VALUE);
+                    composite = alloc.compositeBuffer();
                     composite.addComponent(cumulation).writerIndex(readable);
                 }
                 composite.addComponent(in).writerIndex(composite.writerIndex() + in.readableBytes());
@@ -93,12 +90,14 @@ public class ProtoHandler extends ChannelInboundHandlerAdapter{
     ByteBuf cumulation;
     private Cumulator cumulator = MERGE_CUMULATOR;
     private boolean singleDecode;
-    private boolean decodeWasNull;
     private boolean first;
-    private int discardAfterReads = 16;
-    private int numReads;
 
-
+    public ProtoHandler(Dispather dispather) {
+//    	if (this.isSharable()) {
+//            throw new IllegalStateException("@Sharable annotation is not allowed");
+//        }
+    	this.dispather = dispather;
+    }
 
     /**
      * If set then only one message is decoded on each {@link #channelRead(ChannelHandlerContext, Object)}
@@ -128,17 +127,6 @@ public class ProtoHandler extends ChannelInboundHandlerAdapter{
             throw new NullPointerException("cumulator");
         }
         this.cumulator = cumulator;
-    }
-
-    /**
-     * Set the number of reads after which {@link ByteBuf#discardSomeReadBytes()} are called and so free up memory.
-     * The default is {@code 16}.
-     */
-    public void setDiscardAfterReads(int discardAfterReads) {
-        if (discardAfterReads <= 0) {
-            throw new IllegalArgumentException("discardAfterReads must be > 0");
-        }
-        this.discardAfterReads = discardAfterReads;
     }
 
     /**
@@ -172,12 +160,11 @@ public class ProtoHandler extends ChannelInboundHandlerAdapter{
             ByteBuf bytes = buf.readBytes(readable);
             buf.release();
             ctx.fireChannelRead(bytes);
+            ctx.fireChannelReadComplete();
         } else {
             buf.release();
         }
         cumulation = null;
-        numReads = 0;
-        ctx.fireChannelReadComplete();
         handlerRemoved0(ctx);
     }
 
@@ -206,22 +193,14 @@ public class ProtoHandler extends ChannelInboundHandlerAdapter{
                 throw new DecoderException(t);
             } finally {
                 if (cumulation != null && !cumulation.isReadable()) {
-                    numReads = 0;
                     cumulation.release();
                     cumulation = null;
-                } else if (++ numReads >= discardAfterReads) {
-                    // We did enough reads already try to discard some bytes so we not risk to see a OOME.
-                    // See https://github.com/netty/netty/issues/4275
-                    numReads = 0;
-                    discardSomeReadBytes();
                 }
-
                 int size = out.size();
-                decodeWasNull = !out.insertSinceRecycled();
-                if(size>0){
-                	fireChannelRead(ctx, out, size);
+
+                for (int i = 0; i < size; i ++) {
+                    ctx.fireChannelRead(out.get(i));
                 }
-                
                 out.recycle();
             }
         } else {
@@ -229,29 +208,8 @@ public class ProtoHandler extends ChannelInboundHandlerAdapter{
         }
     }
 
-    /**
-     * Get {@code numElements} out of the {@link List} and forward these through the pipeline.
-     */
-    static void fireChannelRead(ChannelHandlerContext ctx, List<Object> msgs, int numElements) {
-        for (int i = 0; i < numElements; i ++) {
-            ctx.fireChannelRead(msgs.get(i));
-        }
-    }
-
     @Override
     public void channelReadComplete(ChannelHandlerContext ctx) throws Exception {
-        numReads = 0;
-        discardSomeReadBytes();
-        if (decodeWasNull) {
-            decodeWasNull = false;
-            if (!ctx.channel().config().isAutoRead()) {
-                ctx.read();
-            }
-        }
-        ctx.fireChannelReadComplete();
-    }
-
-    protected final void discardSomeReadBytes() {
         if (cumulation != null && !first && cumulation.refCnt() == 1) {
             // discard some bytes if possible to make more room in the
             // buffer but only if the refCnt == 1  as otherwise the user may have
@@ -262,25 +220,11 @@ public class ProtoHandler extends ChannelInboundHandlerAdapter{
             // - https://github.com/netty/netty/issues/1764
             cumulation.discardSomeReadBytes();
         }
+        ctx.fireChannelReadComplete();
     }
 
     @Override
     public void channelInactive(ChannelHandlerContext ctx) throws Exception {
-        channelInputClosed(ctx, true);
-    }
-
-    @Override
-    public void userEventTriggered(ChannelHandlerContext ctx, Object evt) throws Exception {
-        if (evt instanceof ChannelInputShutdownEvent) {
-            // The decodeLast method is invoked when a channelInactive event is encountered.
-            // This method is responsible for ending requests in some situations and must be called
-            // when the input has been shutdown.
-            channelInputClosed(ctx, false);
-        }
-        super.userEventTriggered(ctx, evt);
-    }
-
-    private void channelInputClosed(ChannelHandlerContext ctx, boolean callChannelInactive) throws Exception {
         RecyclableArrayList out = RecyclableArrayList.newInstance();
         try {
             if (cumulation != null) {
@@ -300,14 +244,14 @@ public class ProtoHandler extends ChannelInboundHandlerAdapter{
                     cumulation = null;
                 }
                 int size = out.size();
-                fireChannelRead(ctx, out, size);
+                for (int i = 0; i < size; i++) {
+                    ctx.fireChannelRead(out.get(i));
+                }
                 if (size > 0) {
                     // Something was read, call fireChannelReadComplete()
                     ctx.fireChannelReadComplete();
                 }
-                if (callChannelInactive) {
-                    ctx.fireChannelInactive();
-                }
+                ctx.fireChannelInactive();
             } finally {
                 // recycle in all cases
                 out.recycle();
@@ -327,22 +271,6 @@ public class ProtoHandler extends ChannelInboundHandlerAdapter{
         try {
             while (in.isReadable()) {
                 int outSize = out.size();
-
-                if (outSize > 0) {
-                    fireChannelRead(ctx, out, outSize);
-                    out.clear();
-
-                    // Check if this handler was removed before continuing with decoding.
-                    // If it was removed, it is not safe to continue to operate on the buffer.
-                    //
-                    // See:
-                    // - https://github.com/netty/netty/issues/4635
-                    if (ctx.isRemoved()) {
-                        break;
-                    }
-                    outSize = 0;
-                }
-
                 int oldInputLength = in.readableBytes();
                 decode(ctx, in, out);
 
@@ -379,6 +307,7 @@ public class ProtoHandler extends ChannelInboundHandlerAdapter{
         }
     }
 
+    
 
     /**
      * Is called one last time when the {@link ChannelHandlerContext} goes in-active. Which means the
@@ -416,10 +345,13 @@ public class ProtoHandler extends ChannelInboundHandlerAdapter{
 			List<Object> arg2) throws Exception {
 //		ByteBuf buf = arg1.order(ByteOrder.LITTLE_ENDIAN);
 		ByteBuf buf = arg1;
-		int length = buf.getInt(0);
 		int size = buf.readableBytes();
+		if(size<=0){
+			return;
+		}
+		int length = buf.getInt(0);
 		if(length>size){
-			LOGGER.info("proto decode length="+length+",readbytes="+size);
+			logger.info("proto decode length="+length+",readbytes="+size);
 			return ;
 		}
 		int contentSize = length - 4;
@@ -428,8 +360,9 @@ public class ProtoHandler extends ChannelInboundHandlerAdapter{
 		buf.readBytes(contentBytes, 0, contentSize);
 		String content = new String(contentBytes, CharsetUtil.UTF_8);
 		JSONObject json = JSON.parseObject(content);
-		LOGGER.info("proto decode messages="+content);
+		logger.info("proto decode messages="+content);
 		dispather.handle(json);
+		arg2.add(json);
 	}
 
 }
